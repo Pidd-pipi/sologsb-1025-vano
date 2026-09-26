@@ -65,6 +65,21 @@ interface VersionSnapshot {
   languages: LanguageVersion[];
   note: string;
   emergency: boolean;
+  correctionRef?: string;
+  correctsVersionId?: string;
+}
+
+interface Correction {
+  id: string;
+  referenceNo: string;
+  sourceVersionId: string;
+  sourceVersion: string;
+  reason: string;
+  channels: string[];
+  status: 'open' | 'completed' | 'void';
+  createdAt: string;
+  completedAt?: string;
+  correctionVersionId?: string;
 }
 
 interface NoticeDraft {
@@ -86,6 +101,8 @@ interface NoticeDraft {
   version: string;
   lockedAt?: string;
   emergencyRevision: boolean;
+  corrections: Correction[];
+  activeCorrectionId?: string;
   updatedAt: string;
 }
 
@@ -221,6 +238,7 @@ function initialDraft(): NoticeDraft {
     status: 'in-review',
     version: '1.2.0-draft',
     emergencyRevision: false,
+    corrections: [],
     updatedAt: new Date().toISOString()
   };
 }
@@ -312,6 +330,10 @@ export class AppComponent implements OnInit {
   lastSavedAt = '';
   history: NoticeDraft[] = [];
   future: NoticeDraft[] = [];
+  correctionFormOpen = false;
+  correctionSourceId = '';
+  correctionReason = '';
+  correctionChannels: string[] = [];
 
   constructor(private readonly toastr: NbToastrService) {}
 
@@ -432,6 +454,28 @@ export class AppComponent implements OnInit {
       id: 'discussions', category: '逐句讨论', level: 'warning', title: `${unresolved} 条讨论尚未解决`,
       detail: '发布前请处理或明确忽略未解决讨论。'
     });
+
+    const correction = this.activeCorrection;
+    if (correction) {
+      const missingChannels = correction.channels.filter((channel) => !this.draft.channels.includes(channel));
+      const incompleteLocales = this.draft.requiredLocales.filter((locale) => {
+        const language = this.draft.languages.find((item) => item.id === locale);
+        return !language || !language.title.trim() || !language.body.trim();
+      });
+      if (missingChannels.length || incompleteLocales.length) {
+        const problems: string[] = [];
+        if (missingChannels.length) problems.push(`补发渠道未勾选：${missingChannels.join('、')}`);
+        if (incompleteLocales.length) {
+          const names = incompleteLocales.map((locale) => this.locales.find((item) => item.id === locale)?.name ?? locale);
+          problems.push(`必需语言未补齐：${names.join('、')}`);
+        }
+        checks.push({
+          id: 'correction-readiness', category: '更正要求', level: 'error',
+          title: `更正文 ${correction.referenceNo} 未满足再次锁定条件`,
+          detail: `${problems.join('；')}。补齐后才能再次锁定。`
+        });
+      }
+    }
     return checks;
   }
 
@@ -445,6 +489,21 @@ export class AppComponent implements OnInit {
 
   get isLocked(): boolean {
     return this.draft.status === 'locked';
+  }
+
+  get activeCorrection(): Correction | undefined {
+    return this.draft.corrections.find((correction) => correction.id === this.draft.activeCorrectionId && correction.status === 'open');
+  }
+
+  get correctionSource(): VersionSnapshot | undefined {
+    return this.draft.versions.find((version) => version.id === this.correctionSourceId);
+  }
+
+  get nextCorrectionRef(): string {
+    const source = this.correctionSource;
+    if (!source) return '';
+    const sequence = this.draft.corrections.filter((correction) => correction.sourceVersionId === source.id).length + 1;
+    return `COR-${source.version}-${String(sequence).padStart(2, '0')}`;
   }
 
   get allReviewsApproved(): boolean {
@@ -570,21 +629,46 @@ export class AppComponent implements OnInit {
       this.activeView = 'checks';
       return;
     }
+    const correction = this.activeCorrection;
     const snapshot: VersionSnapshot = {
-      id: uid('version'), label: '最终锁定版本', createdAt: new Date().toISOString(), version: this.nextVersion,
+      id: uid('version'),
+      label: correction ? `更正文 ${correction.referenceNo}` : '最终锁定版本',
+      createdAt: new Date().toISOString(),
+      version: correction ? this.bumpPatch(correction.sourceVersion) : this.nextVersion,
       title: this.draft.title, severity: this.draft.severity, scope: this.draft.scope, eventAt: this.draft.eventAt,
       effectiveAt: this.draft.effectiveAt, expiresAt: this.draft.expiresAt, channels: [...this.draft.channels],
-      languages: clone(this.draft.languages), note: '发布前检查通过并锁定。', emergency: false
+      languages: clone(this.draft.languages),
+      note: correction
+        ? `更正原稿 ${correction.sourceVersion}：${correction.reason}；补发渠道：${correction.channels.join('、')}。`
+        : '发布前检查通过并锁定。',
+      emergency: false,
+      correctionRef: correction?.referenceNo,
+      correctsVersionId: correction?.sourceVersionId
     };
     this.commit((draft) => {
       draft.versions.push(snapshot);
       draft.version = snapshot.version;
       draft.status = 'locked';
       draft.lockedAt = snapshot.createdAt;
+      if (correction) {
+        const record = draft.corrections.find((item) => item.id === correction.id);
+        if (record) {
+          record.status = 'completed';
+          record.completedAt = snapshot.createdAt;
+          record.correctionVersionId = snapshot.id;
+        }
+        draft.activeCorrectionId = undefined;
+      }
     });
-    this.compareBaseId = this.draft.versions.at(-2)?.id ?? '';
-    this.compareTargetId = this.draft.versions.at(-1)?.id ?? '';
-    this.toastr.success(`版本 ${snapshot.version} 已锁定。`, '最终版本已冻结');
+    if (correction) {
+      this.compareBaseId = correction.sourceVersionId;
+      this.compareTargetId = snapshot.id;
+      this.toastr.success(`更正文 ${correction.referenceNo} 已锁定为 ${snapshot.version}，可与原稿对比新旧两版。`, '更正完成');
+    } else {
+      this.compareBaseId = this.draft.versions.at(-2)?.id ?? '';
+      this.compareTargetId = this.draft.versions.at(-1)?.id ?? '';
+      this.toastr.success(`版本 ${snapshot.version} 已锁定。`, '最终版本已冻结');
+    }
   }
 
   startEmergencyRevision(): void {
@@ -600,6 +684,92 @@ export class AppComponent implements OnInit {
     this.toastr.warning('已创建紧急修订稿；锁定版本仍完整保留。', '进入紧急修订');
   }
 
+  startCorrection(): void {
+    if (!this.isLocked) return;
+    const source = this.draft.versions.at(-1);
+    if (!source) return;
+    if (this.hasOpenCorrectionFor(source.id)) {
+      this.toastr.warning('该原稿已有一份未完成的更正稿，请先完成或作废。', '无法重复发起');
+      return;
+    }
+    this.correctionSourceId = source.id;
+    this.correctionChannels = [...source.channels];
+    this.correctionReason = '';
+    this.correctionFormOpen = true;
+  }
+
+  toggleCorrectionChannel(channel: string, checked: boolean): void {
+    this.correctionChannels = checked
+      ? [...new Set([...this.correctionChannels, channel])]
+      : this.correctionChannels.filter((item) => item !== channel);
+  }
+
+  confirmCorrection(): void {
+    const source = this.correctionSource;
+    const reason = this.correctionReason.trim();
+    if (!source || !reason || !this.correctionChannels.length) return;
+    if (this.hasOpenCorrectionFor(source.id)) {
+      this.toastr.warning('该原稿已有一份未完成的更正稿，请先完成或作废。', '无法重复发起');
+      this.correctionFormOpen = false;
+      return;
+    }
+    const correction: Correction = {
+      id: uid('correction'), referenceNo: this.nextCorrectionRef, sourceVersionId: source.id,
+      sourceVersion: source.version, reason, channels: [...this.correctionChannels],
+      status: 'open', createdAt: new Date().toISOString()
+    };
+    this.commit((draft) => {
+      draft.corrections.push(correction);
+      draft.activeCorrectionId = correction.id;
+      draft.status = 'draft';
+      draft.lockedAt = undefined;
+      draft.version = `${this.bumpPatch(source.version)}-correction`;
+    });
+    this.correctionFormOpen = false;
+    this.activeView = 'compose';
+    this.toastr.warning(`更正文 ${correction.referenceNo} 已创建，原稿 ${source.version} 保留在版本链中。`, '进入更正流程');
+  }
+
+  voidCorrection(correction: Correction): void {
+    const source = this.draft.versions.find((version) => version.id === correction.sourceVersionId);
+    this.commit((draft) => {
+      const record = draft.corrections.find((item) => item.id === correction.id);
+      if (record) record.status = 'void';
+      if (draft.activeCorrectionId === correction.id) {
+        draft.activeCorrectionId = undefined;
+        if (source) {
+          draft.title = source.title;
+          draft.severity = source.severity;
+          draft.scope = source.scope;
+          draft.eventAt = source.eventAt;
+          draft.effectiveAt = source.effectiveAt;
+          draft.expiresAt = source.expiresAt;
+          draft.channels = [...source.channels];
+          draft.languages = clone(source.languages);
+          draft.version = source.version;
+        }
+        draft.status = 'locked';
+        draft.lockedAt = source?.createdAt;
+      }
+    });
+    this.toastr.info('更正稿已作废，已回到原稿锁定状态。', '更正流程');
+  }
+
+  compareCorrection(correction: Correction): void {
+    if (!correction.correctionVersionId) return;
+    this.compareBaseId = correction.sourceVersionId;
+    this.compareTargetId = correction.correctionVersionId;
+    this.toastr.info(`正在对比原稿 ${correction.sourceVersion} 与更正文 ${correction.referenceNo}。`, '新旧两版');
+  }
+
+  correctionStatusText(correction: Correction): string {
+    return correction.status === 'completed' ? '已完成' : correction.status === 'void' ? '已作废' : '进行中';
+  }
+
+  versionNumberOf(versionId?: string): string {
+    return this.draft.versions.find((version) => version.id === versionId)?.version ?? '—';
+  }
+
   showCheck(check: CheckResult): void {
     if (check.id.startsWith('missing-') || check.id.startsWith('required-') || check.id.startsWith('banned-') || check.id.startsWith('term-')) {
       const locale = check.id.split('-').at(-1);
@@ -607,6 +777,8 @@ export class AppComponent implements OnInit {
       this.activeView = 'compose';
     } else if (check.id === 'discussions') {
       this.activeView = 'review';
+    } else if (check.id === 'correction-readiness') {
+      this.activeView = 'compose';
     }
   }
 
@@ -669,7 +841,17 @@ export class AppComponent implements OnInit {
     value.discussions ??= [];
     value.reviews ??= [];
     value.requiredLocales ??= ['zh-CN'];
+    value.corrections ??= [];
     return value;
+  }
+
+  private hasOpenCorrectionFor(sourceVersionId: string): boolean {
+    return this.draft.corrections.some((correction) => correction.sourceVersionId === sourceVersionId && correction.status === 'open');
+  }
+
+  private bumpPatch(version: string): string {
+    const [major = 1, minor = 0, patch = 0] = version.split('-')[0].split('.').map(Number);
+    return `${major}.${minor}.${patch + 1}`;
   }
 
   private splitSentences(text: string): string[] {

@@ -30,6 +30,19 @@
 .emergency-banner > div:nth-child(2) { flex: 1; }
 .emergency-banner strong { font-size: 14px; }
 .emergency-banner p { margin: 2px 0 0; color: #8b664c; font-size: 12px; }
+.correction-banner { border-color: #8fc3dd; background: #eef7fc; }
+.correction-banner .emergency-sign { background: #2f7ba6; }
+.correction-banner p { color: #4d6b7d; }
+.correction-panel nb-card-body { display: grid; gap: 14px; }
+.correction-panel .choice-row { margin-top: 0; padding-top: 0; border-top: 0; }
+.correction-actions, .correction-record-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.correction-list { display: grid; gap: 10px; }
+.correction-list article { padding: 13px 14px; border: 1px solid #e2eaea; border-radius: 12px; background: #fafcfc; }
+.correction-list article.open { border-color: #8fc3dd; background: #f4fafd; }
+.correction-list article header { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 6px; }
+.correction-list article header strong { color: #1f5f7e; font-size: 13px; }
+.correction-list article p { margin: 3px 0; color: #6c8188; font-size: 12px; }
+.correction-list .correction-record-actions { margin-top: 9px; }
 .view-grid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; align-items: start; }
 .main-column { min-width: 0; display: grid; gap: 16px; }
 .side-column { display: grid; gap: 14px; }

@@ -40,7 +40,7 @@
         <span>03</span><strong>角色审阅</strong><small>逐句讨论与责任确认</small>
       </button>
       <button [class.active]="activeView === 'versions'" (click)="activeView = 'versions'">
-        <span>04</span><strong>锁定与比较</strong><small>冻结、紧急修订、差异</small>
+        <span>04</span><strong>锁定与比较</strong><small>冻结、更正、差异比较</small>
       </button>
     </nav>
 
@@ -48,6 +48,15 @@
       <div class="emergency-sign">修订</div>
       <div><strong>正在处理紧急修订</strong><p>已从锁定版本派生新草稿，原版本不会被覆盖。完成后需重新进行发布检查。</p></div>
       <button nbButton status="warning" size="small" (click)="activeView = 'checks'">前往检查</button>
+    </div>
+
+    <div *ngIf="activeCorrection as correction" class="emergency-banner correction-banner">
+      <div class="emergency-sign">更正</div>
+      <div>
+        <strong>更正文 {{ correction.referenceNo }} 起草中</strong>
+        <p>来源原稿 {{ correction.sourceVersion }} · 补发渠道：{{ correction.channels.join('、') }} · 原因：{{ correction.reason }}</p>
+      </div>
+      <button nbButton status="info" size="small" (click)="activeView = 'checks'">前往检查</button>
     </div>
 
     <main *ngIf="activeView === 'compose'" class="view-grid compose-grid">
@@ -184,6 +193,7 @@
             </nb-card-body>
           </nb-card>
           <nb-alert status="info" *ngIf="draft.status === 'in-review'">当前稿处于审阅状态。锁定后如需修改，必须发起紧急修订。</nb-alert>
+          <nb-alert status="warning" *ngIf="activeCorrection as correction">更正文 {{ correction.referenceNo }} 起草中：再次锁定前必须勾选全部补发渠道，并补齐必需语言版本。</nb-alert>
         </aside>
       </div>
     </section>
@@ -239,9 +249,10 @@
 
     <section *ngIf="activeView === 'versions'" class="view-section">
       <div class="section-heading">
-        <div><span class="eyebrow">版本控制</span><h2>冻结、比较与紧急修订</h2><p>最终锁定版本不可覆盖；紧急修订会从当前版本继续，并保留完整历史。</p></div>
+        <div><span class="eyebrow">版本控制</span><h2>冻结、更正与紧急修订</h2><p>最终锁定版本不可覆盖；发现影响范围或时间写错时发起更正，更正文带来源编号并与原稿一起留在版本链中。</p></div>
         <div class="version-actions">
           <button nbButton status="danger" (click)="lockVersion()" [disabled]="isLocked">锁定当前版本</button>
+          <button nbButton status="info" (click)="startCorrection()" [disabled]="!isLocked">发起更正</button>
           <button nbButton status="warning" (click)="startEmergencyRevision()" [disabled]="!isLocked">发起紧急修订</button>
         </div>
       </div>
@@ -252,12 +263,57 @@
             <nb-card-body class="timeline">
               <article *ngFor="let version of draft.versions; let last = last" [class.current]="last">
                 <span></span>
-                <div><b>{{ version.version }}</b><strong>{{ version.label }}</strong><p>{{ formatDateTime(version.createdAt) }} · {{ version.channels.length }} 个渠道</p><small *ngIf="version.emergency">紧急修订</small></div>
+                <div><b>{{ version.version }}</b><strong>{{ version.label }}</strong><p>{{ formatDateTime(version.createdAt) }} · {{ version.channels.length }} 个渠道</p><small *ngIf="version.emergency">紧急修订</small><small *ngIf="version.correctionRef">更正文 {{ version.correctionRef }} · 更正原稿 {{ versionNumberOf(version.correctsVersionId) }}</small></div>
               </article>
             </nb-card-body>
           </nb-card>
         </aside>
         <div class="main-column">
+          <nb-card class="panel correction-panel" *ngIf="correctionFormOpen">
+            <nb-card-header>
+              <div><span class="section-kicker">发起更正</span><h3>更正文 {{ nextCorrectionRef }}</h3></div>
+              <span class="status-pill">来源原稿 {{ correctionSource?.version }}</span>
+            </nb-card-header>
+            <nb-card-body>
+              <p class="muted">原稿「{{ correctionSource?.title }}」已锁定。请勾选需要补发的受影响渠道并说明更正原因；生成后原稿保留在版本链中，草稿将解锁供修改。</p>
+              <div class="choice-row">
+                <span class="field-label">受影响渠道 *</span>
+                <label class="choice" *ngFor="let channel of channelOptions">
+                  <nb-checkbox [checked]="correctionChannels.includes(channel)" (checkedChange)="toggleCorrectionChannel(channel, $event)">{{ channel }}</nb-checkbox>
+                </label>
+              </div>
+              <label class="field"><span>更正原因 *</span>
+                <textarea nbInput fullWidth rows="3" [(ngModel)]="correctionReason" placeholder="例如：原稿停水时间写错，正确时间为 9 月 27 日 13:00–17:00…"></textarea>
+              </label>
+              <nb-alert status="info">更正文再次锁定前，必须补齐所选渠道与全部必需语言版本；同一原稿只能有一份未完成的更正稿。</nb-alert>
+              <div class="correction-actions">
+                <button nbButton status="primary" [disabled]="!correctionReason.trim() || !correctionChannels.length" (click)="confirmCorrection()">生成更正文并解锁修改</button>
+                <button nbButton status="basic" (click)="correctionFormOpen = false">取消</button>
+              </div>
+            </nb-card-body>
+          </nb-card>
+
+          <nb-card class="panel">
+            <nb-card-header><div><span class="section-kicker">更正留痕</span><h3>更正记录</h3></div><span class="count-pill">{{ draft.corrections.length }}</span></nb-card-header>
+            <nb-card-body class="correction-list">
+              <article *ngFor="let correction of draft.corrections" [class.open]="correction.status === 'open'">
+                <header>
+                  <strong>{{ correction.referenceNo }}</strong>
+                  <span class="status-pill" [class.locked]="correction.status === 'completed'">{{ correctionStatusText(correction) }}</span>
+                </header>
+                <p>原稿 {{ correction.sourceVersion }} → {{ correction.correctionVersionId ? versionNumberOf(correction.correctionVersionId) : '待锁定' }} · 发起于 {{ formatDateTime(correction.createdAt) }}</p>
+                <p>原因：{{ correction.reason }}</p>
+                <p>补发渠道：{{ correction.channels.join('、') }}</p>
+                <div class="correction-record-actions">
+                  <button *ngIf="correction.status === 'completed'" nbButton size="tiny" status="info" (click)="compareCorrection(correction)">查看新旧两版</button>
+                  <button *ngIf="correction.status === 'open'" nbButton size="tiny" status="primary" (click)="activeView = 'compose'">继续编辑</button>
+                  <button *ngIf="correction.status === 'open'" nbButton size="tiny" status="basic" (click)="voidCorrection(correction)">作废</button>
+                </div>
+              </article>
+              <p *ngIf="!draft.corrections.length" class="empty-copy">还没有更正记录。锁定后发现影响范围或停水时间写错时，可点击“发起更正”。</p>
+            </nb-card-body>
+          </nb-card>
+
           <nb-card class="panel">
             <nb-card-header class="diff-header">
               <div><span class="section-kicker">文本比较</span><h3>两版正文差异</h3></div>
@@ -284,7 +340,7 @@
             <nb-card-body class="version-summary">
               <article *ngFor="let version of draft.versions">
                 <div><span>{{ version.version }}</span><h3>{{ version.title }}</h3><p>{{ version.note }}</p></div>
-                <dl><dt>严重程度</dt><dd>{{ version.severity }}</dd><dt>失效</dt><dd>{{ formatDateTime(version.expiresAt) }}</dd></dl>
+                <dl><dt>严重程度</dt><dd>{{ version.severity }}</dd><dt>失效</dt><dd>{{ formatDateTime(version.expiresAt) }}</dd><ng-container *ngIf="version.correctionRef"><dt>来源编号</dt><dd>{{ version.correctionRef }}</dd></ng-container></dl>
               </article>
             </nb-card-body>
           </nb-card>
