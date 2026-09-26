@@ -21,6 +21,7 @@ type WorkspaceView = 'compose' | 'checks' | 'review' | 'versions';
 type ReviewStatus = 'pending' | 'approved' | 'changes';
 type NoticeStatus = 'draft' | 'in-review' | 'locked';
 type CheckLevel = 'error' | 'warning' | 'info';
+type SnapshotType = 'normal' | 'emergency' | 'correction';
 
 interface LanguageVersion {
   id: string;
@@ -50,11 +51,27 @@ interface RoleReview {
   note: string;
 }
 
+interface ActiveCorrection {
+  /** 被更正原稿（锁定快照）的编号 */
+  sourceVersionId: string;
+  /** 原稿通知编号，如 NO-20260926-001 */
+  sourceNo: string;
+  /** 更正文编号，如 NO-20260926-001-C1 */
+  correctionNo: string;
+  /** 本次更正需要补发的受影响渠道 */
+  channels: string[];
+  /** 发起更正时填写的原因 */
+  reason: string;
+  startedAt: string;
+}
+
 interface VersionSnapshot {
   id: string;
   label: string;
   createdAt: string;
   version: string;
+  /** 业务通知编号，锁定后用于渠道补发与更正向溯源 */
+  noticeNo?: string;
   title: string;
   severity: string;
   scope: string;
@@ -65,6 +82,16 @@ interface VersionSnapshot {
   languages: LanguageVersion[];
   note: string;
   emergency: boolean;
+  type: SnapshotType;
+  /** 更正快照：被更正原稿的快照 id */
+  sourceVersionId?: string;
+  /** 更正快照：被更正原稿的通知编号 */
+  sourceNo?: string;
+  /** 更正快照：更正文编号 */
+  correctionNo?: string;
+  /** 更正快照：本次补发渠道与更正原因 */
+  correctionChannels?: string[];
+  correctionReason?: string;
 }
 
 interface NoticeDraft {
@@ -86,6 +113,8 @@ interface NoticeDraft {
   version: string;
   lockedAt?: string;
   emergencyRevision: boolean;
+  /** 未完成的更正稿；同一原稿同时至多一份 */
+  correction?: ActiveCorrection;
   updatedAt: string;
 }
 
@@ -129,6 +158,7 @@ function initialDraft(): NoticeDraft {
     label: '首次发布稿',
     createdAt: '2026-09-23T08:10:00+08:00',
     version: '1.0.0',
+    noticeNo: 'NO-20260923-001',
     title: '台风“海燕”橙色预警通知',
     scope: '滨海新区沿海街道',
     severity: '橙色',
@@ -138,6 +168,7 @@ function initialDraft(): NoticeDraft {
     channels: ['短信', '广播', '社区大屏'],
     note: '发布范围覆盖滨海新区。',
     emergency: false,
+    type: 'normal',
     languages: [
       {
         id: 'zh-CN', locale: 'zh-CN', name: '简体中文', title: '台风“海燕”橙色预警通知',
@@ -158,9 +189,12 @@ function initialDraft(): NoticeDraft {
     label: '扩大影响范围',
     createdAt: '2026-09-24T10:35:00+08:00',
     version: '1.1.0',
+    noticeNo: 'NO-20260924-001',
     title: '台风“海燕”橙色预警及人员转移通知',
     scope: '滨海新区全区，重点为沿海街道',
     note: '增加沿海街道转移要求。',
+    emergency: false,
+    type: 'normal',
     languages: [
       {
         ...clone(first.languages[0]),
@@ -313,6 +347,11 @@ export class AppComponent implements OnInit {
   history: NoticeDraft[] = [];
   future: NoticeDraft[] = [];
 
+  /** 更正发起表单 */
+  correctionChannelSelection: Record<string, boolean> = {};
+  correctionReason = '';
+  correctionFormError = '';
+
   constructor(private readonly toastr: NbToastrService) {}
 
   ngOnInit(): void {
@@ -382,6 +421,23 @@ export class AppComponent implements OnInit {
       id: 'channels', category: '发布渠道', level: 'error', title: '未选择目标渠道', detail: '至少选择一个目标发布渠道。'
     });
 
+    if (this.isCorrecting) {
+      const correction = this.activeCorrection!;
+      this.missingCorrectionChannels.forEach((channel) => checks.push({
+        id: `correction-channel-${channel}`, category: '更正补发', level: 'error',
+        title: `更正稿未覆盖补发渠道「${channel}」`,
+        detail: `渠道「${channel}」在发起更正时被列为受影响渠道，请在目标渠道中补齐后再锁定更正文（来源 ${correction.sourceNo}）。`
+      }));
+      this.missingCorrectionLocales.forEach((locale) => {
+        const name = this.locales.find((item) => item.id === locale)?.name ?? locale;
+        checks.push({
+          id: `correction-locale-${locale}`, category: '更正补发', level: 'error',
+          title: `更正稿必需语言「${name}」未补齐`,
+          detail: `发起更正时该语言属于必需语言，请补全标题与正文后再锁定更正文（来源 ${correction.sourceNo}）。`
+        });
+      });
+    }
+
     this.draft.requiredLocales.forEach((locale) => {
       if (!this.draft.languages.some((language) => language.id === locale)) {
         const name = this.locales.find((item) => item.id === locale)?.name ?? locale;
@@ -447,6 +503,76 @@ export class AppComponent implements OnInit {
     return this.draft.status === 'locked';
   }
 
+  get isCorrecting(): boolean {
+    return !!this.draft.correction && !this.isLocked;
+  }
+
+  get activeCorrection(): ActiveCorrection | undefined {
+    return this.isCorrecting ? this.draft.correction : undefined;
+  }
+
+  /** 当前锁定的原稿快照 */
+  get lockedSnapshot(): VersionSnapshot | undefined {
+    return this.draft.versions.at(-1);
+  }
+
+  /** 更正稿对应的原稿快照 */
+  get correctionSource(): VersionSnapshot | undefined {
+    const correction = this.draft.correction;
+    if (!correction) return undefined;
+    return this.draft.versions.find((version) => version.id === correction.sourceVersionId);
+  }
+
+  /** 发起更正表单中勾选的补发渠道 */
+  get selectedCorrectionChannels(): string[] {
+    return this.channelOptions.filter((channel) => this.correctionChannelSelection[channel]);
+  }
+
+  /** 锁定原稿是否已存在未完成更正（同一原稿至多一份） */
+  get lockedSourceHasOpenCorrection(): boolean {
+    const locked = this.lockedSnapshot;
+    return !!locked && !!this.draft.correction && this.draft.correction.sourceVersionId === locked.id;
+  }
+
+  /** 更正稿尚未补齐的必需补发渠道 */
+  get missingCorrectionChannels(): string[] {
+    const correction = this.activeCorrection;
+    if (!correction) return [];
+    return correction.channels.filter((channel) => !this.draft.channels.includes(channel));
+  }
+
+  /** 更正稿尚未补齐内容的必需语言 */
+  get missingCorrectionLocales(): string[] {
+    const correction = this.activeCorrection;
+    if (!correction) return [];
+    return this.draft.requiredLocales.filter((locale) => {
+      const language = this.draft.languages.find((item) => item.id === locale);
+      return !language || !language.title.trim() || !language.body.trim();
+    });
+  }
+
+  /** 更正稿是否允许重新锁定：受影响渠道与必需语言全部补齐 */
+  get correctionReadyToLock(): boolean {
+    return this.isCorrecting
+      && this.missingCorrectionChannels.length === 0
+      && this.missingCorrectionLocales.length === 0;
+  }
+
+  /** 自动生成的更正文（随更正文一起发出，明确本次更正针对哪条原稿） */
+  get correctionNoticeText(): string {
+    const correction = this.activeCorrection;
+    if (!correction) return '';
+    const language = this.draft.languages.find((item) => item.id === this.selectedLanguageId) ?? this.draft.languages[0];
+    return [
+      `【更正通知 ${correction.correctionNo}】`,
+      `本通知为原稿 ${correction.sourceNo}（${this.correctionSource?.title ?? ''}）的更正稿，原通知相关内容以本稿为准。`,
+      `更正原因：${correction.reason}`,
+      `补发渠道：${correction.channels.join('、')}。`,
+      language ? `更正后标题：${language.title}` : '',
+      language ? `更正后正文：${language.body}` : ''
+    ].filter(Boolean).join('\n');
+  }
+
   get allReviewsApproved(): boolean {
     return this.draft.reviews.every((review) => review.status === 'approved');
   }
@@ -471,6 +597,10 @@ export class AppComponent implements OnInit {
     const baseLanguage = base.languages.find((language) => language.id === this.selectedLanguageId);
     const targetLanguage = target.languages.find((language) => language.id === this.selectedLanguageId);
     return this.diffSentences(this.splitSentences(baseLanguage?.body ?? ''), this.splitSentences(targetLanguage?.body ?? ''));
+  }
+
+  get diffTargetVersion(): VersionSnapshot | undefined {
+    return this.draft.versions.find((version) => version.id === this.compareTargetId);
   }
 
   updateMeta(field: 'title' | 'eventType' | 'severity' | 'scope' | 'eventAt' | 'effectiveAt' | 'expiresAt', value: string): void {
@@ -506,6 +636,23 @@ export class AppComponent implements OnInit {
       const language = draft.languages.find((item) => item.id === this.selectedLanguageId);
       if (language) language.reviewed = checked;
     });
+  }
+
+  get addableLocales(): { id: string; name: string }[] {
+    return this.locales.filter((locale) => !this.draft.languages.some((language) => language.id === locale.id));
+  }
+
+  addLanguage(localeId: string): void {
+    const locale = this.locales.find((item) => item.id === localeId);
+    if (!locale || this.isLocked) return;
+    this.commit((draft) => {
+      draft.languages.push({
+        id: locale.id, locale: locale.id, name: locale.name,
+        title: '', body: '', translator: this.currentRole === '翻译' ? '周晴' : '待分配', reviewed: false
+      });
+    });
+    this.selectedLanguageId = locale.id;
+    this.toastr.info(`已添加${locale.name}版本，请补全标题与正文。`, '语言版本');
   }
 
   selectSentence(index: number): void {
@@ -549,7 +696,7 @@ export class AppComponent implements OnInit {
 
   applyTemplate(): void {
     const template = this.templates.find((item) => item.id === this.selectedTemplateId);
-    if (!template || this.isLocked) return;
+    if (!template || this.isLocked || this.isCorrecting) return;
     this.commit((draft) => {
       draft.eventType = template.eventType;
       draft.severity = template.severity;
@@ -570,24 +717,74 @@ export class AppComponent implements OnInit {
       this.activeView = 'checks';
       return;
     }
+    const correcting = this.isCorrecting;
+    const correction = correcting ? this.activeCorrection! : undefined;
+    if (correcting && !this.correctionReadyToLock) {
+      this.toastr.warning('受影响渠道或必需语言尚未补齐，更正稿不能锁定。', '更正未完成');
+      this.activeView = 'checks';
+      return;
+    }
+
+    const now = new Date().toISOString();
+    let nextVersion: string;
+    let snapshotType: SnapshotType;
+    if (correcting) {
+      nextVersion = this.correctionNextVersion;
+      snapshotType = 'correction';
+    } else {
+      nextVersion = this.nextVersion;
+      snapshotType = this.draft.emergencyRevision ? 'emergency' : 'normal';
+    }
+
     const snapshot: VersionSnapshot = {
-      id: uid('version'), label: '最终锁定版本', createdAt: new Date().toISOString(), version: this.nextVersion,
+      id: uid('version'),
+      label: correcting ? '更正文' : this.draft.emergencyRevision ? '紧急修订版本' : '最终锁定版本',
+      createdAt: now,
+      version: nextVersion,
+      noticeNo: correcting ? correction!.correctionNo : this.buildNoticeNo(now),
       title: this.draft.title, severity: this.draft.severity, scope: this.draft.scope, eventAt: this.draft.eventAt,
       effectiveAt: this.draft.effectiveAt, expiresAt: this.draft.expiresAt, channels: [...this.draft.channels],
-      languages: clone(this.draft.languages), note: '发布前检查通过并锁定。', emergency: false
+      languages: clone(this.draft.languages),
+      note: correcting
+        ? `更正原稿 ${correction!.sourceNo}：${correction!.reason}`
+        : this.draft.emergencyRevision ? '紧急修订后重新检查并锁定。' : '发布前检查通过并锁定。',
+      emergency: !correcting && this.draft.emergencyRevision,
+      type: snapshotType,
+      sourceVersionId: correcting ? correction!.sourceVersionId : undefined,
+      sourceNo: correcting ? correction!.sourceNo : undefined,
+      correctionNo: correcting ? correction!.correctionNo : undefined,
+      correctionChannels: correcting ? [...correction!.channels] : undefined,
+      correctionReason: correcting ? correction!.reason : undefined
     };
     this.commit((draft) => {
       draft.versions.push(snapshot);
       draft.version = snapshot.version;
       draft.status = 'locked';
       draft.lockedAt = snapshot.createdAt;
+      draft.emergencyRevision = false;
+      draft.correction = undefined;
     });
-    this.compareBaseId = this.draft.versions.at(-2)?.id ?? '';
+    this.compareBaseId = correcting ? correction!.sourceVersionId : (this.draft.versions.at(-2)?.id ?? '');
     this.compareTargetId = this.draft.versions.at(-1)?.id ?? '';
-    this.toastr.success(`版本 ${snapshot.version} 已锁定。`, '最终版本已冻结');
+    this.toastr.success(
+      correcting ? `更正文 ${snapshot.noticeNo} 已锁定，可在版本链对照原稿 ${correction!.sourceNo}。` : `版本 ${snapshot.version} 已锁定。`,
+      correcting ? '更正已发布' : '最终版本已冻结'
+    );
+  }
+
+  /** 更正稿版本号：在原稿版本上递增修订位 */
+  get correctionNextVersion(): string {
+    const source = this.correctionSource;
+    const base = source?.version ?? this.draft.version.split('-')[0];
+    const [major = 1, minor = 0, patch = 0] = base.split('.').map(Number);
+    return `${major}.${minor}.${patch + 1}`;
   }
 
   startEmergencyRevision(): void {
+    if (this.isCorrecting) {
+      this.toastr.warning('当前更正稿尚未完成，不能再发起紧急修订。', '操作受限');
+      return;
+    }
     const baseVersion = this.draft.version.split('-')[0];
     const [major = 1, minor = 0] = baseVersion.split('.').map(Number);
     this.commit((draft) => {
@@ -598,6 +795,171 @@ export class AppComponent implements OnInit {
     });
     this.activeView = 'compose';
     this.toastr.warning('已创建紧急修订稿；锁定版本仍完整保留。', '进入紧急修订');
+  }
+
+  /** 初始化发起更正表单：默认勾选原稿全部渠道 */
+  prepareCorrectionForm(): void {
+    const source = this.lockedSnapshot;
+    this.correctionChannelSelection = {};
+    this.channelOptions.forEach((channel) => {
+      this.correctionChannelSelection[channel] = !!source?.channels.includes(channel);
+    });
+    this.correctionReason = '';
+    this.correctionFormError = '';
+  }
+
+  toggleCorrectionFormChannel(channel: string, checked: boolean): void {
+    this.correctionChannelSelection = { ...this.correctionChannelSelection, [channel]: checked };
+    this.correctionFormError = '';
+  }
+
+  /** 发起更正：选择受影响渠道、填写原因，生成带来源编号的更正文 */
+  confirmStartCorrection(): void {
+    if (!this.isLocked || !this.lockedSnapshot) return;
+    if (this.lockedSourceHasOpenCorrection) {
+      this.correctionFormError = '该原稿已有一份未完成的更正稿，完成或放弃后才能再次发起。';
+      return;
+    }
+    const channels = this.selectedCorrectionChannels;
+    const reason = this.correctionReason.trim();
+    if (!channels.length) {
+      this.correctionFormError = '请至少选择一个需要补发的受影响渠道。';
+      return;
+    }
+    if (!reason) {
+      this.correctionFormError = '请填写更正原因（如影响范围或停水时间有误）。';
+      return;
+    }
+    const source = this.lockedSnapshot;
+    const correction: ActiveCorrection = {
+      sourceVersionId: source.id,
+      sourceNo: source.noticeNo ?? this.buildNoticeNo(source.createdAt),
+      correctionNo: this.buildCorrectionNo(source),
+      channels,
+      reason,
+      startedAt: new Date().toISOString()
+    };
+    this.commit((draft) => {
+      draft.status = 'draft';
+      draft.emergencyRevision = false;
+      draft.correction = correction;
+      draft.version = `${source.version}-correction`;
+      draft.lockedAt = undefined;
+      // 更正稿在原稿基础上继续改；补发渠道是待办清单，需在“目标渠道”逐一补齐后才能锁定
+    });
+    this.correctionFormError = '';
+    this.activeView = 'compose';
+    this.toastr.warning(
+      `已从原稿 ${correction.sourceNo} 派生更正稿 ${correction.correctionNo}，原锁定稿保留在版本链中。`,
+      '进入更正流程'
+    );
+  }
+
+  /** 放弃未完成的更正稿，工作区回到被更正的原稿 */
+  cancelCorrection(): void {
+    const correction = this.draft.correction;
+    if (!correction) return;
+    const source = this.correctionSource;
+    this.commit((draft) => {
+      if (source) {
+        draft.title = source.title;
+        draft.severity = source.severity;
+        draft.scope = source.scope;
+        draft.eventAt = source.eventAt;
+        draft.effectiveAt = source.effectiveAt;
+        draft.expiresAt = source.expiresAt;
+        draft.channels = [...source.channels];
+        draft.languages = clone(source.languages);
+        draft.version = source.version;
+      }
+      draft.status = 'locked';
+      draft.lockedAt = source?.createdAt;
+      draft.emergencyRevision = false;
+      draft.correction = undefined;
+    });
+    this.correctionFormError = '';
+    this.activeView = 'versions';
+    this.toastr.info('已放弃更正稿，工作区恢复为原稿锁定状态。', '更正已取消');
+  }
+
+  /** 更正稿编辑期间调整补发渠道范围 */
+  toggleCorrectionChannel(channel: string, checked: boolean): void {
+    this.commit((draft) => {
+      if (!draft.correction) return;
+      draft.correction.channels = checked
+        ? [...new Set([...draft.correction.channels, channel])]
+        : draft.correction.channels.filter((item) => item !== channel);
+    });
+  }
+
+  /** 内容改好后，确认把全部受影响渠道纳入本次更正文的补发范围 */
+  markCorrectionChannelsCovered(): void {
+    this.commit((draft) => {
+      if (!draft.correction) return;
+      draft.channels = [...new Set([...draft.channels, ...draft.correction.channels])];
+    });
+    this.toastr.success('已将受影响渠道全部纳入目标渠道，请继续检查必需语言。', '补发渠道已覆盖');
+  }
+
+  setCorrectionReason(reason: string): void {
+    this.commit((draft) => {
+      if (draft.correction) draft.correction.reason = reason;
+    });
+  }
+
+  /** 在版本链中直接对照某份更正稿与其原稿 */
+  compareCorrection(version: VersionSnapshot): void {
+    if (version.type !== 'correction' || !version.sourceVersionId) return;
+    this.compareBaseId = version.sourceVersionId;
+    this.compareTargetId = version.id;
+    const sourceLanguage = this.draft.versions.find((item) => item.id === version.sourceVersionId)?.languages[0]?.id;
+    if (sourceLanguage) this.selectedLanguageId = sourceLanguage;
+    this.activeView = 'versions';
+  }
+
+  copyCorrectionNotice(): void {
+    const text = this.correctionNoticeText;
+    if (!text) return;
+    const done = () => this.toastr.success('更正文已复制，可粘贴到补发渠道。', '复制成功');
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(() => this.fallbackCopy(text, done));
+    } else {
+      this.fallbackCopy(text, done);
+    }
+  }
+
+  private fallbackCopy(text: string, done: () => void): void {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      document.execCommand('copy');
+      done();
+    } catch {
+      this.toastr.warning('浏览器不支持自动复制，请手动选择文本。', '复制失败');
+    }
+    document.body.removeChild(textarea);
+  }
+
+  private buildNoticeNo(at: string): string {
+    const date = new Date(at);
+    const stamp = Number.isNaN(date.getTime())
+      ? new Date().toISOString().slice(0, 10).replace(/-/g, '')
+      : at.slice(0, 10).replace(/-/g, '');
+    const dailyCount = this.draft.versions
+      .filter((version) => (version.noticeNo ?? '').includes(`NO-${stamp}-`)).length + 1;
+    return `NO-${stamp}-${String(dailyCount).padStart(3, '0')}`;
+  }
+
+  /** 更正文编号：来源编号 + 针对该原稿的更正序号 */
+  private buildCorrectionNo(source: VersionSnapshot): string {
+    const sequence = this.draft.versions.filter(
+      (version) => version.type === 'correction' && version.sourceVersionId === source.id
+    ).length + 1;
+    return `${source.noticeNo}-C${sequence}`;
   }
 
   showCheck(check: CheckResult): void {
@@ -669,6 +1031,19 @@ export class AppComponent implements OnInit {
     value.discussions ??= [];
     value.reviews ??= [];
     value.requiredLocales ??= ['zh-CN'];
+    value.emergencyRevision ??= false;
+    value.correction ??= undefined;
+    // 兼容旧版本存档：补全快照类型与通知编号，保证历史稿也能作为更正来源
+    value.versions.forEach((version, index) => {
+      version.type ??= version.emergency ? 'emergency' : 'normal';
+      if (!version.noticeNo) {
+        const date = new Date(version.createdAt);
+        const stamp = Number.isNaN(date.getTime())
+          ? new Date().toISOString().slice(0, 10).replace(/-/g, '')
+          : version.createdAt.slice(0, 10).replace(/-/g, '');
+        version.noticeNo = `NO-${stamp}-${String(index + 1).padStart(3, '0')}`;
+      }
+    });
     return value;
   }
 
